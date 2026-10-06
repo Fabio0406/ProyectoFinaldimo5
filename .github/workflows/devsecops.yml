@@ -1,0 +1,184 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [main, develop, 'feature/**']
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  JAVA_VERSION: '21'
+  IMAGE_NAME: springboot-devsecops-lab
+
+jobs:
+  # ------------------------------------------------------------------
+  # 1. CI: compilacion y pruebas
+  # ------------------------------------------------------------------
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Compilar y ejecutar pruebas
+        run: mvn -B clean verify
+
+      - name: Publicar JAR y reportes de pruebas
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-and-test-reports
+          path: |
+            target/*.jar
+            target/surefire-reports/
+            target/site/jacoco/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ------------------------------------------------------------------
+  # 2. SAST: analisis del codigo fuente con Semgrep
+  # ------------------------------------------------------------------
+  sast-semgrep:
+    name: SAST - Semgrep
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Ejecutar Semgrep
+        run: |
+          semgrep scan \
+            --config auto \
+            --config .semgrep.yml \
+            --json --output semgrep-report.json \
+            .
+
+      - name: Publicar reporte de Semgrep
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-report
+          path: semgrep-report.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ------------------------------------------------------------------
+  # 3. SCA: analisis de dependencias con Trivy (pom.xml)
+  # ------------------------------------------------------------------
+  sca-trivy:
+    name: SCA - Trivy (dependencias)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Ejecutar Trivy sobre las dependencias
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          format: json
+          output: trivy-sca-report.json
+          exit-code: '0'
+
+      - name: Publicar reporte SCA
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-sca-report
+          path: trivy-sca-report.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ------------------------------------------------------------------
+  # 4. Policy as Code: politicas OPA/Conftest sobre el Dockerfile
+  # ------------------------------------------------------------------
+  policy-conftest:
+    name: Policy as Code - Conftest (Dockerfile)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Ejecutar Conftest sobre el Dockerfile
+        run: |
+          docker run --rm -v "$PWD:/project" -w /project openpolicyagent/conftest \
+            test Dockerfile --policy policy --output json > conftest-report.json || true
+          cat conftest-report.json
+
+      - name: Publicar reporte de Conftest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conftest-report
+          path: conftest-report.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ------------------------------------------------------------------
+  # 5. Imagen del proyecto: construccion, escaneo y entrega para el CD local
+  # ------------------------------------------------------------------
+  image-build-scan:
+    name: Imagen - Build & Trivy
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Definir tag de la imagen
+        run: echo "IMAGE_TAG=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Construir imagen del proyecto
+        run: docker build -t "$IMAGE_NAME:$IMAGE_TAG" .
+
+      - name: Escanear imagen con Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          format: json
+          output: trivy-image-report.json
+          exit-code: '0'
+
+      - name: Publicar reporte de la imagen
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-report
+          path: trivy-image-report.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      # La imagen escaneada es la misma que se despliega en el entorno local.
+      - name: Exportar imagen para el despliegue local
+        if: github.event_name != 'pull_request' && (github.ref_name == 'main' || github.ref_name == 'develop')
+        run: docker save "$IMAGE_NAME:$IMAGE_TAG" | gzip > "$IMAGE_NAME.tar.gz"
+
+      - name: Publicar imagen como artifact
+        if: github.event_name != 'pull_request' && (github.ref_name == 'main' || github.ref_name == 'develop')
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: ${{ env.IMAGE_NAME }}.tar.gz
+          compression-level: 0
+          retention-days: 7

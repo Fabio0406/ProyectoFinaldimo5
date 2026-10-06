@@ -1,0 +1,10 @@
+# CD local: despliega la imagen construida y escaneada por GitHub Actions.
+# IMAGE_TAG es el SHA corto del commit (lo define deploy-local.ps1).
+services:
+  app:
+    image: springboot-devsecops-lab:${IMAGE_TAG:?Definir IMAGE_TAG con el tag de la imagen cargada}
+    container_name: springboot-devsecops-lab
+    ports:
+      # Aplicacion deliberadamente vulnerable: se publica solo en localhost.
+      - "127.0.0.1:8080:8080"
+    restart: unless-stopped
